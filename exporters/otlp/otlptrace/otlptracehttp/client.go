@@ -65,14 +65,84 @@ type client struct {
 	stopOnce    sync.Once
 }
 
+// loggingTransport wraps an http.RoundTripper and logs request/response bodies
+type loggingTransport struct {
+	wrapped http.RoundTripper
+}
+
+// RoundTrip implements http.RoundTripper interface and logs the request/response
+func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Log request
+	reqBody, err := t.readAndReplaceBody(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read request body: %w", err)
+	}
+
+	otel.Handle(fmt.Errorf("Request: %s %s\nHeaders: %v\nBody: %s",
+		req.Method, req.URL, req.Header, string(reqBody)))
+
+	// Execute the request
+	resp, err := t.wrapped.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Log response
+	respBody, err := t.readAndReplaceResponseBody(resp)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	otel.Handle(fmt.Errorf("Response: %d %s\nHeaders: %v\nBody: %s",
+		resp.StatusCode, resp.Status, resp.Header, string(respBody)))
+
+	return resp, nil
+}
+
+// readAndReplaceBody reads the body and replaces it with a new reader
+func (t *loggingTransport) readAndReplaceBody(req *http.Request) ([]byte, error) {
+	if req.Body == nil {
+		return nil, nil
+	}
+
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Body.Close()
+	req.Body = io.NopCloser(bytes.NewBuffer(body))
+	return body, nil
+}
+
+// readAndReplaceResponseBody reads the response body and replaces it with a new reader
+func (t *loggingTransport) readAndReplaceResponseBody(resp *http.Response) ([]byte, error) {
+	if resp.Body == nil {
+		return nil, nil
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewBuffer(body))
+	return body, nil
+}
+
 var _ otlptrace.Client = (*client)(nil)
 
 // NewClient creates a new HTTP trace client.
 func NewClient(opts ...Option) otlptrace.Client {
 	cfg := otlpconfig.NewHTTPConfig(asHTTPOptions(opts)...)
 
+	transport := &loggingTransport{
+		wrapped: ourTransport,
+	}
+
 	httpClient := &http.Client{
-		Transport: ourTransport,
+		Transport: transport,
 		Timeout:   cfg.Traces.Timeout,
 	}
 
